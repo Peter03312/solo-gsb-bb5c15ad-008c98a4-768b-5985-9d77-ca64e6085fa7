@@ -377,6 +377,212 @@
     return out;
   }
 
+  /* --------------------- 回路负载与超载区间（精确解析解） --------------------- */
+
+  /**
+   * 某盏灯在临时调光记录下、t 所在开区间上实际输出的表达式：
+   * actual(t) = q*t^2 + a*t + b
+   * （调用方保证 t 不落在任何转折点上：此时生效段唯一，归还融合的原版亮度亦为线性）
+   *
+   *  - 覆盖渐变 / 保持：q=0，直线或常量；
+   *  - 归还融合中：actual = (1-k)*from + k*base(t)，base 在开区间内为线性，
+   *    故 actual 为二次函数（同秒 0 秒操作等特殊情形已由 prepareOverrides 预存 from 处理）；
+   *  - 无接管或已完全跟随原版：退化为原版亮度的一次表达式。
+   */
+  function actualExprAt(byLight, baseCues, lightId, t) {
+    const segs = byLight.get(lightId);
+    let active = null;
+    if (segs) {
+      for (const seg of segs) {
+        if (seg.time > t) break; // 已按 time, seq 排序
+        active = seg;
+      }
+    }
+    if (!active) {
+      // 无接管：取原版亮度表达式（0 秒瞬变已结束段在 lineAt 中按常量处理，与 brightnessAt 同语义）
+      const line = lineAt(baseCues, lightId, t);
+      return { a: line.a, b: line.b, q: 0 };
+    }
+
+    if (active.duration === 0) {
+      // 0 秒操作：覆盖恒为目标；归还立即完成、完全跟随原版
+      return active.opType === 'override'
+        ? { a: 0, b: active.target, q: 0 }
+        : lineAt(baseCues, lightId, t);
+    }
+    if (t < active.time || t >= active.end) {
+      // 区间内 t 应落在 (seg.time, seg.end)；取到端点是近重复转折点的退化情形，按常量处理
+      return { a: 0, b: segOutput(active, t, baseCues), q: 0 };
+    }
+
+    if (active.opType === 'override') {
+      const a = (active.target - active.from) / active.duration;
+      return { a, b: active.from - a * active.time, q: 0 };
+    }
+
+    // 归还融合：actual = (1-k)*from + k*base(t)
+    // 设 d=duration, T=seg.time, base(t)=m*t+c, k=(t-T)/d
+    // actual = from + (t-T)/d * (m*t + c - from)
+    //        = (m/d) t^2 + ((c-from-m*T)/d) t + from - T(c-from)/d
+    const m0 = lineAt(baseCues, lightId, t);
+    const { a: m, b: c } = m0;
+    const d = active.duration;
+    const T = active.time;
+    const from = active.from;
+    const q = m / d;
+    const a = (c - from - m * T) / d;
+    const b = from - (T * (c - from)) / d;
+    return { a, b, q };
+  }
+
+  /** 收集一盏灯（在原版 Cue 与临时操作叠加下）影响实际输出形态的全部转折点 */
+  function collectActualBreakpoints(baseCues, segs, start, end, out) {
+    for (const seg of baseCues) {
+      // 触发时刻对普通渐变与 0 秒瞬变都是转折点；渐变结束时刻仅 duration>0 时与触发点不同
+      if (seg.time >= start && seg.time <= end) out.push(seg.time);
+      if (seg.duration > 0 && seg.end >= start && seg.end <= end) out.push(seg.end);
+    }
+    if (!segs) return;
+    for (const s of segs) {
+      if (s.time >= start && s.time <= end) out.push(s.time);
+      if (s.duration > 0 && s.end >= start && s.end <= end) out.push(s.end);
+    }
+  }
+
+  /**
+   * 开区间 (u,v) 内 f(t)=a*t+b0 为线性，求 f(t) > 0 的部分，端点严格不含。
+   * 用于「无临时操作」或实际输出为一次式的回路。
+   */
+  function pushLinearPositive(pieces, a, b0, u, v) {
+    if (Math.abs(a) <= EPS) {
+      if (b0 > EPS) pieces.push({ lo: u, hi: v, loInc: false, hiInc: false });
+      return;
+    }
+    const r = snapEdge(-b0 / a, u, v); // f = 0 的交点
+    if (a > 0) {
+      if (r < v) pieces.push({ lo: Math.max(u, r), hi: v, loInc: false, hiInc: false });
+    } else if (r > u) {
+      pieces.push({ lo: u, hi: Math.min(v, r), loInc: false, hiInc: false });
+    }
+  }
+
+  /**
+   * 开区间 (u,v) 内 f(t)=q*t^2+a*t+b0 为二次函数，求 f(t) > 0 的部分（端点严格不含）。
+   * 用求根公式精确给出交点，杜绝固定步长采样漏掉短时超载。
+   */
+  function pushQuadraticPositive(pieces, q, a, b0, u, v) {
+    const open = (lo, hi) => {
+      if (hi - lo > EPS) pieces.push({ lo, hi, loInc: false, hiInc: false });
+    };
+    if (Math.abs(q) <= EPS) return pushLinearPositive(pieces, a, b0, u, v);
+
+    const disc = a * a - 4 * q * b0;
+    if (disc < -EPS) {
+      // 无实根：整段同号
+      if (q > 0) open(u, v);
+      return;
+    }
+    if (disc <= EPS) {
+      // 重根：f 恒不小于/大于 0，严格大于只在重根以外（重根本身等于 0）
+      const rt = snapEdge(-a / (2 * q), u, v);
+      if (q > 0) {
+        open(u, Math.min(v, rt));
+        open(Math.max(u, rt), v);
+      }
+      return;
+    }
+    const sq = Math.sqrt(disc);
+    let r1 = (-a - sq) / (2 * q);
+    let r2 = (-a + sq) / (2 * q);
+    if (r1 > r2) [r1, r2] = [r2, r1];
+    r1 = snapEdge(r1, u, v);
+    r2 = snapEdge(r2, u, v);
+
+    if (q > 0) {
+      // 开口向上：两根之外为正
+      open(u, Math.min(v, r1));
+      open(Math.max(u, r2), v);
+    } else {
+      // 开口向下：两根之间为正
+      open(Math.max(u, r1), Math.min(v, r2));
+    }
+  }
+
+  /**
+   * 计算时窗 [start, end] 内，某条回路负载严格大于其容量的全部连续区间。
+   *
+   * 精确做法（不做固定间隔采样）：
+   *  1. 转折点 = 窗内该回路各灯的 Cue 触发时刻、渐变结束时刻，以及临时调光操作的
+   *     触发/结束时刻。瞬变（0 秒 Cue、0 秒覆盖）只在触发点造成跳变，其余位置连续。
+   *  2. 相邻转折点之间：
+   *       · 无临时调光时各灯亮度为一次式，负载为一次函数；
+   *       · 绑定临时调光记录时，归还融合中的实际输出 = 进度 × 持续变化的原版亮度，
+   *         为二次函数；覆盖为一次式。回路负载为各灯贡献之和（二次/一次）。
+   *     与 0（容量差）的交点用一次/二次方程精确求出，严格超出故交点为开端点。
+   *  3. 每个转折点按引擎语义（同秒编号顺序、瞬变、中途接管、覆盖/归还融合）取真实负载，
+   *     超载则作为闭单点参与合并，准确界定跳变时刻的端点包含性（含「仅某一瞬间超载」
+   *     的零长度区间 [t,t]）。
+   *
+   * members: [{ light_id, rated_watts }]（仅含已分配到该回路、额定瓦数为正的灯具）
+   * capacity: 该回路冻结容量（正数）
+   * 返回与 differenceIntervals 相同的区间对象数组；start === end 返回 []。
+   */
+  function overloadIntervals(baseCues, byLight, members, capacity, start, end) {
+    if (!(end > start)) return [];
+
+    const bp = [start, end];
+    for (const m of members) {
+      collectActualBreakpoints(baseCues, byLight.get(m.light_id), start, end, bp);
+    }
+    bp.sort((x, y) => x - y);
+    // 近重复转折点合并（来自不同灯、在浮点误差内重合的时刻），避免退化段漏判
+    const points = [];
+    for (const t of bp) {
+      if (!points.length || Math.abs(points[points.length - 1] - t) > EPS) points.push(t);
+    }
+
+    const loadAt = (t) => {
+      let sum = 0;
+      for (const m of members) {
+        sum += (overrideBrightnessAt(byLight, baseCues, m.light_id, t) / 100) * m.rated_watts;
+      }
+      return sum;
+    };
+
+    const pieces = [];
+
+    // 转折点上的真实负载（瞬变跳变只可能发生在这里；严格超出 → 闭单点）
+    for (const p of points) {
+      if (loadAt(p) - capacity > EPS) {
+        pieces.push({ lo: p, hi: p, loInc: true, hiInc: true });
+      }
+    }
+
+    // 相邻转折点之间：负载为二次（归还融合）或一次函数，精确求超载部分
+    for (let i = 0; i + 1 < points.length; i++) {
+      const u = points[i];
+      const v = points[i + 1];
+      if (!(v - u > EPS)) continue;
+      const mid = (u + v) / 2;
+      let q = 0;
+      let a = 0;
+      let b = -capacity;
+      let quadratic = false;
+      for (const m of members) {
+        const e = actualExprAt(byLight, baseCues, m.light_id, mid);
+        const w = m.rated_watts / 100;
+        q += (e.q || 0) * w;
+        a += e.a * w;
+        b += e.b * w;
+        if (Math.abs(e.q || 0) > EPS) quadratic = true;
+      }
+      if (quadratic) pushQuadraticPositive(pieces, q, a, b, u, v);
+      else pushLinearPositive(pieces, a, b, u, v);
+    }
+
+    return unionPieces(pieces);
+  }
+
   return {
     clamp,
     prepareCues,
@@ -388,5 +594,7 @@
     overrideBrightnessAt,
     overrideLevelsAt,
     activeOverride,
+    overloadIntervals,
+    actualExprAt,
   };
 });

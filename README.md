@@ -5,6 +5,8 @@
 支持播放 / 暂停 / 跳转，并实时显示任意时刻每盏灯的实际亮度；发布后生成**不可变演出版本**。
 排演人员还可针对已发布版本建立**临时调光记录**，按演出时码追加「覆盖 / 归还」操作，
 随时查看任意时刻的**逐灯实际输出**；记录绑定版本快照，草稿修改与新版本发布都不影响既有记录。
+排演时还可给灯具配置**所属调光回路与正数额定瓦数**、给回路设置**正数容量（瓦）**，
+发布后随时按窗口分析各回路的**负载与严格超载区间**，提前预判回路超载。
 
 技术栈：Node.js + Express + SQLite（better-sqlite3），原生 HTML/CSS/JS 前端，无前端构建步骤。
 
@@ -41,6 +43,32 @@
   整次提交（含批量）**不部分写入**。
 - **随时重算**：跳转或刷新页面后，依据绑定的版本快照与操作序列重算任意时刻逐灯实际输出
   （页面地址栏 `#record=<id>&t=<时刻>` 可直接定位到某记录的某时刻）。
+
+## 回路配置与负载预判
+
+排演时为真实配电情况建模，提前发现调光回路超载：
+
+- **回路**：草稿中建立回路并设置**严格正数容量（瓦）**。容量为 0、负数或非数字会被明确拒绝。
+- **灯具电气属性**：每盏灯可设置**所属回路**与**正数额定瓦数（W）**。
+  已分配回路的灯具必须带正数额定瓦数；引用不存在的回路、瓦数 ≤ 0 或非数字都会被拒绝
+  （整次提交不落库，不部分保存）。**未分配回路（或未设瓦数）的灯具不计入任何回路负载**。
+- **随发布冻结**：发布版本时，回路（含容量）、灯具的回路归属与额定瓦数与灯具、Cue 一起
+  做完整快照。发布后再改草稿回路/容量/瓦数，不影响已发布版本及其分析结果。
+- **旧版本兼容**：本功能上线前发布、没有回路配置的版本**仍可正常播放**；对其做负载分析时
+  不产生任何回路负载（返回空回路列表与 `has_circuit_config: false`）。
+- **负载口径**：选择**已发布版本**或**绑定它的临时调光记录**，给定非负时窗 `[start,end]`
+  与窗内查看时刻 `at`：按每灯**实际亮度 ÷ 100 × 额定瓦数**汇总到所属回路。
+  - 选择版本时取版本快照的原版亮度；选择记录时取叠加覆盖/归还后的**实际输出**
+    （瞬变、同秒顺序、渐变中途接管、归还时与持续变化的原版亮度融合，全部沿用既有规则）。
+  - 返回查看时刻每条回路的负载、是否超载、各灯贡献，以及时窗内负载
+    **严格大于容量**的全部连续区间及端点包含性（`[ ]` 含端点、`( )` 不含，
+    零长度 `[t,t]` 表示仅该瞬间超载）。
+  - **不做固定步长采样**：转折点（Cue 触发、渐变结束、临时操作触发/结束）之间，
+    普通/覆盖段负载是一次函数，归还融合段（实际输出与线性变化的原版亮度凸组合）是
+    **二次函数**，交点用一次/二次方程精确求出，毫秒级短时超载也不会漏掉。
+  - 分析**只读**：不修改草稿、版本、调光记录，也不影响任何播放会话；既有亮度接口语义不变。
+- 无效容量、额定瓦数、回路引用、时窗（负数/非数字/起点大于终点/查看时刻越界）、
+  版本或记录不存在都会返回 `400/404` 中文错误。
 
 ## 一键启动（Docker Compose）
 
@@ -112,6 +140,11 @@ npm test                  # 运行灯光渐变引擎单元测试
    类型（覆盖/归还）、时长（覆盖再填目标亮度）追加操作；拖动时间轴或输入查看时刻即可重算
    逐灯的原版亮度与实际输出（覆盖中/归还融合中/跟随原版）。操作只追加（时码不早于末项，
    同秒按追加顺序）；若有人同时追加导致修订号过期，会自动拉取最新序列后提示重试。
+7. **回路配置**：在「回路配置」页建立回路（名称 + 正数额定容量），并在同页灯具表中为每盏灯
+   选择所属回路、填写正数额定瓦数；未分配回路的灯具不计入负载。配置属于草稿，发布时冻结。
+8. **回路负载预判**：在「回路负载」页选择已发布版本或绑定它的临时调光记录，填写非负时窗与
+   窗内查看时刻后分析。页面给出查看时刻各回路负载/余量/是否超载、窗内严格超载的全部连续区间
+   及端点包含性，以及各回路逐灯的实际亮度与功率贡献；无回路配置的旧版本明确提示“不产生负载”。
 
 ## 版本比对 HTTP API
 
@@ -243,42 +276,151 @@ curl 'http://localhost:3000/api/records/1/output?at=9'
   时码早于末项、归还携带目标亮度、缺少修订号 → 400；修订号过期 → 409。
   批量追加时任一条非法则整批拒绝（**不部分写入**）。
 
+## 回路配置 HTTP API
+
+回路与灯具电气属性属于草稿；发布时一并冻结进版本快照。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/circuits` | 草稿回路列表（含各回路灯具数 `light_count`） |
+| POST | `/api/circuits` | 新建回路 `{name, capacity}`，`capacity` 必须为严格正数（瓦） |
+| PATCH | `/api/circuits/:id` | 修改回路名称/容量（容量仍须严格正数） |
+| DELETE | `/api/circuits/:id` | 删除回路（仍被灯具引用时返回 409） |
+| PATCH | `/api/lights/:id` | 修改灯具：`{name?, circuit_id?, rated_watts?}`；`null`/空串表示取消回路分配 |
+
+灯具的电气规则（`POST /api/lights` 与 `PATCH /api/lights/:id` 均适用）：
+
+- `circuit_id` 缺省或为 `null`/空串：未分配回路，不计入负载；否则必须是已存在回路的正整数编号。
+- `rated_watts` 缺省或为 `null`/空串：未设置；一旦提供必须为**严格正数**。
+- **已分配回路的灯具必须同时带正数额定瓦数**，否则整次请求被拒绝（不部分保存）。
+
+```bash
+# 建一条容量 2000W 的回路
+curl -X POST http://localhost:3000/api/circuits \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"面光回路A","capacity":2000}'
+
+# 建灯时直接派到回路 1、额定 750W
+curl -X POST http://localhost:3000/api/lights \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"面光1","circuit_id":1,"rated_watts":750}'
+
+# 非法容量 / 非法瓦数 / 引用不存在的回路 → 400，且不落库
+curl -X POST http://localhost:3000/api/circuits \
+  -H 'Content-Type: application/json' -d '{"name":"坏回路","capacity":0}'
+# {"error":"回路容量无效：0（必须为严格正数，0 或负数不允许）"}
+```
+
+发布版本的快照（`GET /api/versions/:id`、`GET /api/records/:id`）中新增：
+
+- `circuits`: `[{id, name, capacity}, ...]` —— 发布时刻冻结的回路与容量；
+  本功能上线前的旧版本为空数组。
+- `lights[]` 每项新增 `circuit_id`（旧版本为 `null`）与 `rated_watts`。
+
+## 回路负载分析 HTTP API
+
+`GET /api/load`（query）或 `POST /api/load`（JSON body），参数相同，**只读**：
+
+| 参数 | 含义 |
+| --- | --- |
+| `version_id` | 已发布版本编号（正整数；不存在返回 404）。与 `record_id` 二选一 |
+| `record_id` | 绑定某已发布版本的临时调光记录编号（不存在返回 404）；取覆盖/归还后的实际输出 |
+| `start` / `end` | 非负时窗起止秒数，`start > end` 报错；二者相等为零长度时窗（只返回该时刻负载） |
+| `at` | 窗内查看时刻（非负秒数），必须落在 `[start, end]` 内 |
+
+调用示例：
+
+```bash
+# 分析已发布版本 1 在 [0,10] 内、查看时刻 t=4 的回路负载
+curl 'http://localhost:3000/api/load?version_id=1&start=0&end=10&at=4'
+
+# 分析绑定该版本的临时调光记录 2（含覆盖/归还的实际输出）
+curl -X POST http://localhost:3000/api/load \
+  -H 'Content-Type: application/json' \
+  -d '{"record_id":2,"start":0,"end":10,"at":4}'
+```
+
+返回（节选）：
+
+```json
+{
+  "source": {"kind": "version", "version": {"id": 1, "label": "首演"}},
+  "window": {"start": 0, "end": 10},
+  "at": 4,
+  "has_circuit_config": true,
+  "circuits": [
+    {
+      "circuit_id": 1,
+      "name": "面光回路A",
+      "capacity": 2000,
+      "load_at": 1650,
+      "overloaded_at": false,
+      "members": [
+        {"light_id": 1, "name": "面光1", "rated_watts": 750, "brightness": 60, "watts": 450}
+      ],
+      "intervals": [
+        {"start": 5, "end": 7.5, "start_inclusive": true, "end_inclusive": false}
+      ]
+    }
+  ],
+  "unassigned_light_ids": [3]
+}
+```
+
+- `load_at`：查看时刻该回路的总功率（W）= Σ 实际亮度/100 × 额定瓦数；
+  `overloaded_at` 为是否**严格**超出容量。
+- `intervals`：窗内负载严格大于容量的全部连续区间；容量交点不含（开端点），
+  瞬变造成的跳变时刻按真实取值决定是否包含；零长度 `[t,t]` 表示仅该瞬间超载。
+  归还融合期间负载是二次函数，交点用求根公式精确给出，**不做固定步长采样**。
+- `members`：查看时刻各灯实际亮度与功率贡献；`unassigned_light_ids`
+  列出未分配回路（因此不计入负载）的灯具。
+- 无回路配置的旧版本：`has_circuit_config` 为 `false`、`circuits` 为 `[]`，仍可播放。
+- 版本/记录不存在 → 404；时窗或时刻非数字/为负/起点大于终点/查看时刻越界 → 400。
+
 ## HTTP API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/lights` | 灯具列表 |
-| POST | `/api/lights` | 新增灯具 `{name}` |
+| GET | `/api/lights` | 灯具列表（含 `circuit_id`、`rated_watts`） |
+| POST | `/api/lights` | 新增灯具 `{name, circuit_id?, rated_watts?}` |
+| PATCH | `/api/lights/:id` | 修改灯具名称/所属回路/额定瓦数 |
 | DELETE | `/api/lights/:id` | 删除灯具（仍被草稿 Cue 引用时返回 409） |
+| GET | `/api/circuits` | 草稿回路列表（含容量与灯具数） |
+| POST | `/api/circuits` | 新建回路 `{name, capacity}`（容量严格正数） |
+| PATCH | `/api/circuits/:id` | 修改回路名称/容量 |
+| DELETE | `/api/circuits/:id` | 删除回路（仍被灯具引用时返回 409） |
 | GET | `/api/cues` | 草稿 Cue 列表（按时码、编号排序） |
 | POST | `/api/cues` | 新增 Cue，接受单条对象或数组（数组为批量，整批事务） |
 | PATCH | `/api/cues/:id` | 修改草稿 Cue |
 | DELETE | `/api/cues/:id` | 删除草稿 Cue |
-| POST | `/api/versions` | 冻结当前草稿，发布不可变版本 |
+| POST | `/api/versions` | 冻结当前草稿（含回路配置），发布不可变版本 |
 | GET | `/api/versions` | 版本列表 |
-| GET | `/api/versions/:id` | 版本完整快照（灯具 + Cue，供播放器使用） |
+| GET | `/api/versions/:id` | 版本完整快照（灯具 + Cue + 回路，供播放器使用） |
 | GET/POST | `/api/compare` | 两版亮度差异比对（查看时刻逐灯亮度 + 超差连续区间 + 配置差异），只读 |
 | POST | `/api/records` | 针对已发布版本建立临时调光记录 |
 | GET | `/api/records` | 调光记录列表 |
-| GET | `/api/records/:id` | 记录详情（绑定版本快照 + 操作序列） |
+| GET | `/api/records/:id` | 记录详情（绑定版本快照 + 冻结回路配置 + 操作序列） |
 | DELETE | `/api/records/:id` | 删除记录及其操作 |
 | POST | `/api/records/:id/ops` | 追加覆盖/归还操作（携带修订号，单条或批量，整批事务） |
 | GET | `/api/records/:id/output` | 查询某时刻逐灯原版亮度与实际输出，只读重算 |
+| GET/POST | `/api/load` | 回路负载分析（查看时刻负载 + 严格超载连续区间 + 逐灯贡献），只读 |
 
 所有错误返回 `400/404/409` 与形如 `{"error": "具体中文原因"}` 的 JSON。
 
 ## 目录结构
 
 ```
-server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录（修订号/追加事务）
-src/db.js            SQLite 初始化与表结构（含调光记录与操作序列表）
-public/engine.js     纯函数灯光渐变引擎（浏览器/Node 共用，含线性渐变、中途接管、精确差值区间、覆盖/归还重算）
-public/index.html    单页界面
+server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录（修订号/追加事务）、回路配置与负载分析
+src/db.js            SQLite 初始化与表结构（含调光记录、操作序列与回路/灯具电气属性表；旧卷自动加列迁移）
+public/engine.js     纯函数灯光渐变引擎（浏览器/Node 共用，含线性渐变、中途接管、精确差值区间、覆盖/归还重算、回路负载与一次/二次精确超载区间）
+public/index.html    单页界面（含回路配置页与回路负载分析页）
 public/styles.css    剧场暗色主题
-public/app.js        前端交互、版本比对页、播放器与调光记录页（基于 requestAnimationFrame 的播放、快照本地重算）
+public/app.js        前端交互、版本比对页、播放器、调光记录页与回路配置/负载页（基于 requestAnimationFrame 的播放、快照本地重算）
 test/engine.test.js  渐变规则单元测试
 test/compare.test.js 两版亮度差区间单元测试（交点精度、端点包含性、瞬变、接管）
 test/override.test.js 覆盖/归还单元测试（渐变起点、同秒顺序、中途接管、0 秒立即生效、归还融合）
+test/load.test.js    回路超载区间引擎单元测试（线性/二次交点、瞬变、同秒、接管、短时脉冲不遗漏）
+test/api-load.test.js 回路配置与负载分析 HTTP API 集成测试（校验、冻结、旧版本兼容、记录负载、只读）
 Dockerfile           镜像构建（依赖、初始化、启动）
 docker-compose.yml   一键编排
 ```
