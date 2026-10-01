@@ -194,3 +194,4 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .cmp-cfg-group { margin: .35rem 0; font-size: .88rem; }
 .cmp-cfg-group.only-a b { color: var(--ok); }
 .cmp-cfg-group.only-b b { color: var(--amber); }
+.danger-text { color: var(--danger); font-weight: 600; }

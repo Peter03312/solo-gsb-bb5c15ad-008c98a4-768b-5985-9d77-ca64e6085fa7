@@ -34,6 +34,12 @@ function toPosInt(v) {
   return Number.isInteger(n) && n > 0 ? n : NaN;
 }
 
+// 正实数：容量、额定瓦数
+function toPosNum(v) {
+  const n = toNum(v);
+  return typeof n === 'number' && n > 0 ? n : NaN;
+}
+
 /**
  * 校验一条 Cue 的可写字段。
  * 返回 { value: {cue_no?, light_id, time, target, duration} } 或 { error }。
@@ -158,6 +164,138 @@ app.delete('/api/lights/:id', (req, res) => {
   res.status(204).end();
 });
 
+/* ------------------------------- 灯光回路 ------------------------------ */
+// 草稿期配置：回路有正数容量（瓦）；灯具可分配到某回路并登记正数额定瓦数。
+// 未分配回路（circuit_id 为空）的灯具不计入任何回路负载。
+// 全部写接口逐条严格校验，单条请求为一个事务，非法即拒绝、不部分保存。
+
+const circuitSelect = `
+SELECT c.id, c.name, c.capacity, c.created_at,
+       (SELECT COUNT(*) FROM lights l WHERE l.circuit_id = c.id) AS light_count
+FROM circuits c ORDER BY c.id ASC
+`;
+
+function readCircuit(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    capacity: row.capacity,
+    light_count: row.light_count,
+    created_at: row.created_at,
+  };
+}
+
+function getCircuit(id) {
+  return db
+    .prepare(
+      `SELECT c.id, c.name, c.capacity, c.created_at,
+              (SELECT COUNT(*) FROM lights l WHERE l.circuit_id = c.id) AS light_count
+       FROM circuits c WHERE c.id = ?`
+    )
+    .get(id);
+}
+
+app.get('/api/circuits', (req, res) => {
+  res.json(db.prepare(circuitSelect).all().map(readCircuit));
+});
+
+app.post('/api/circuits', (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (!NAME_RE.test(name)) return err(res, 400, '回路名称不能为空');
+
+  const capacity = toPosNum(req.body?.capacity);
+  if (Number.isNaN(capacity)) {
+    return err(res, 400, `无效容量：${JSON.stringify(req.body?.capacity)}（须为正数瓦数）`);
+  }
+
+  try {
+    const info = db
+      .prepare('INSERT INTO circuits (name, capacity, created_at) VALUES (?, ?, ?)')
+      .run(name, capacity, Date.now() / 1000);
+    res.status(201).json(readCircuit(getCircuit(info.lastInsertRowid)));
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) return err(res, 409, `回路名称已存在：${name}`);
+    throw e;
+  }
+});
+
+app.patch('/api/circuits/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const row = db.prepare('SELECT * FROM circuits WHERE id = ?').get(id);
+  if (!row) return err(res, 404, `回路 ${id} 不存在`);
+
+  const body = req.body || {};
+  const merged = {
+    name: 'name' in body ? body.name : row.name,
+    capacity: 'capacity' in body ? body.capacity : row.capacity,
+  };
+  const name = typeof merged.name === 'string' ? merged.name.trim() : '';
+  if (!NAME_RE.test(name)) return err(res, 400, '回路名称不能为空');
+  const capacity = toPosNum(merged.capacity);
+  if (Number.isNaN(capacity)) {
+    return err(res, 400, `无效容量：${JSON.stringify(merged.capacity)}（须为正数瓦数）`);
+  }
+
+  try {
+    db.prepare('UPDATE circuits SET name = ?, capacity = ? WHERE id = ?').run(name, capacity, id);
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) return err(res, 409, `回路名称已存在：${name}`);
+    throw e;
+  }
+  res.json(readCircuit(getCircuit(id)));
+});
+
+app.delete('/api/circuits/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const row = db.prepare('SELECT * FROM circuits WHERE id = ?').get(id);
+  if (!row) return err(res, 404, `回路 ${id} 不存在`);
+
+  const n = db.prepare('SELECT COUNT(*) AS n FROM lights WHERE circuit_id = ?').get(id).n;
+  if (n > 0) {
+    return err(
+      res,
+      409,
+      `回路 ${row.name} 下仍有 ${n} 盏灯，请先把这些灯改投其他回路或取消分配后再删除`
+    );
+  }
+  db.prepare('DELETE FROM circuits WHERE id = ?').run(id);
+  res.status(204).end();
+});
+
+// 灯具接线：设置所属回路与正数额定瓦数；circuit_id 传 null/空 表示取消分配（瓦数一并清空）
+app.put('/api/lights/:id/wiring', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const light = db.prepare('SELECT * FROM lights WHERE id = ?').get(id);
+  if (!light) return err(res, 404, `灯具 ${id} 不存在`);
+
+  const body = req.body || {};
+  const rawCircuit = body.circuit_id;
+  const unassign = rawCircuit === null || rawCircuit === undefined || rawCircuit === '';
+
+  let circuitId = null;
+  if (!unassign) {
+    circuitId = toPosInt(rawCircuit);
+    if (Number.isNaN(circuitId)) {
+      return err(res, 400, `无效回路引用：${JSON.stringify(rawCircuit)}（须为已存在回路编号，或 null 取消分配）`);
+    }
+    const circuit = db.prepare('SELECT id FROM circuits WHERE id = ?').get(circuitId);
+    if (!circuit) return err(res, 400, `回路引用不存在：编号 ${circuitId} 尚未建立`);
+  }
+
+  let watts = null;
+  if (!unassign) {
+    watts = toPosNum(body.watts);
+    if (Number.isNaN(watts)) {
+      return err(res, 400, `无效额定瓦数：${JSON.stringify(body.watts)}（灯具已分配回路时须为正数额定瓦数）`);
+    }
+  } else if (body.watts !== undefined && body.watts !== null && body.watts !== '') {
+    return err(res, 400, '未分配回路的灯具不能设置额定瓦数（不计入任何回路负载）');
+  }
+
+  db.prepare('UPDATE lights SET circuit_id = ?, watts = ? WHERE id = ?').run(circuitId, watts, id);
+  res.json(db.prepare('SELECT * FROM lights WHERE id = ?').get(id));
+});
+
 /* ------------------------------- 草稿 Cue ------------------------------ */
 
 app.get('/api/cues', (req, res) => {
@@ -262,6 +400,19 @@ function loadVersionSnapshot(versionId) {
        FROM version_cues WHERE version_id = ? ORDER BY time, cue_no`
     )
     .all(versionId);
+  // 回路配置随发布冻结；无回路表数据的早期版本返回空集（播放照常，不产生回路负载）
+  const circuits = db
+    .prepare(
+      `SELECT circuit_id AS id, name, capacity
+       FROM version_circuits WHERE version_id = ? ORDER BY pos`
+    )
+    .all(versionId);
+  const wiring = db
+    .prepare(
+      `SELECT light_id, circuit_id, watts
+       FROM version_light_wiring WHERE version_id = ?`
+    )
+    .all(versionId);
   return {
     id: version.id,
     label: version.label,
@@ -269,6 +420,8 @@ function loadVersionSnapshot(versionId) {
     cue_count: version.cue_count,
     lights,
     cues,
+    circuits,
+    wiring,
   };
 }
 
@@ -283,6 +436,7 @@ app.post('/api/versions', (req, res) => {
        FROM cues ORDER BY time, cue_no`
     )
     .all();
+  const circuits = db.prepare('SELECT * FROM circuits ORDER BY id').all();
 
   const tx = db.transaction(() => {
     const info = db
@@ -299,6 +453,15 @@ app.post('/api/versions', (req, res) => {
     cues.forEach((c, i) =>
       insC.run(vid, c.cue_no, c.light_id, c.time, c.target, c.duration, i)
     );
+    // 回路与接线（灯具的所属回路 + 额定瓦数）随版本一并冻结
+    const insCircuit = db.prepare(
+      'INSERT INTO version_circuits (version_id, circuit_id, name, capacity, pos) VALUES (?, ?, ?, ?, ?)'
+    );
+    circuits.forEach((c, i) => insCircuit.run(vid, c.id, c.name, c.capacity, i));
+    const insWiring = db.prepare(
+      'INSERT INTO version_light_wiring (version_id, light_id, circuit_id, watts) VALUES (?, ?, ?, ?)'
+    );
+    lights.forEach((l) => insWiring.run(vid, l.id, l.circuit_id, l.watts));
     return vid;
   });
 
@@ -309,7 +472,11 @@ app.post('/api/versions', (req, res) => {
 app.get('/api/versions', (req, res) => {
   res.json(
     db
-      .prepare('SELECT id, label, created_at, cue_count FROM versions ORDER BY id DESC')
+      .prepare(
+        `SELECT v.id, v.label, v.created_at, v.cue_count,
+                (SELECT COUNT(*) FROM version_circuits vc WHERE vc.version_id = v.id) AS circuit_count
+         FROM versions v ORDER BY id DESC`
+      )
       .all()
   );
 });
@@ -721,6 +888,134 @@ app.get('/api/records/:id/output', (req, res) => {
     levels,
   });
 });
+
+/* ----------------------- 回路负载预判（只读精确分析） ----------------------- */
+// 针对已发布版本，或绑定它的临时调光记录：按每灯【实际亮度/100×额定瓦数】汇总到回路，
+// 返回查看时刻各回路负载，以及时窗内【严格超出】容量的全部连续区间（含端点包含性）。
+// 瞬变、同秒顺序、渐变接管、归还与持续变化原版亮度的融合均走灯光引擎既有规则；
+// 区间在转折点之间用一/二次方程精确求根，不做固定步长采样。只读，不改动任何数据。
+
+function parseLoadWindow(input) {
+  const nums = {};
+  const labels = { start: '时窗起点', end: '时窗终点', at: '查看时刻' };
+  for (const field of ['start', 'end', 'at']) {
+    const n = toNum(input[field]);
+    if (Number.isNaN(n)) {
+      return { error: `${labels[field]}无效：${JSON.stringify(input[field])}（须为非负数字秒数）` };
+    }
+    if (n < 0) return { error: `${labels[field]}无效：${n}（不得为负）` };
+    nums[field] = n;
+  }
+  if (nums.start > nums.end) {
+    return { error: `时窗起点（${nums.start}）不能大于终点（${nums.end}）` };
+  }
+  if (nums.at < nums.start || nums.at > nums.end) {
+    return { error: `查看时刻 ${nums.at} 超出时窗 [${nums.start}, ${nums.end}]` };
+  }
+  return { value: nums };
+}
+
+// 由版本快照构造回路 -> 成员灯具（{light_id, watts}）映射；未分配回路的灯具不计入
+function buildCircuitMembers(snap) {
+  const members = new Map();
+  for (const c of snap.circuits) members.set(c.id, []);
+  for (const w of snap.wiring) {
+    if (w.circuit_id === null || w.circuit_id === undefined) continue;
+    if (!members.has(w.circuit_id)) continue; // 防御：接线指向快照内不存在的回路
+    members.get(w.circuit_id).push({ light_id: w.light_id, watts: w.watts });
+  }
+  for (const list of members.values()) list.sort((x, y) => x.light_id - y.light_id);
+  return members;
+}
+
+function handleLoad(req, res) {
+  const input = { ...req.query, ...(req.body || {}) };
+
+  // 分析目标：版本 或 绑定版本的调光记录，二者恰好给一个
+  const hasVersion = input.version_id !== undefined && input.version_id !== '';
+  const hasRecord = input.record_id !== undefined && input.record_id !== '';
+  if (hasVersion === hasRecord) {
+    return err(res, 400, '请且仅请指定一个分析目标：version_id（已发布版本）或 record_id（绑定该版本的调光记录）');
+  }
+
+  let snap;
+  let recordInfo = null;
+  if (hasRecord) {
+    const recordId = toPosInt(input.record_id);
+    if (Number.isNaN(recordId)) {
+      return err(res, 400, `调光记录编号无效：${JSON.stringify(input.record_id)}（须为正整数）`);
+    }
+    const meta = loadRecordMeta(recordId);
+    if (!meta) return err(res, 404, `调光记录不存在：#${recordId}`);
+    snap = loadVersionSnapshot(meta.version_id);
+    recordInfo = {
+      id: meta.id,
+      label: meta.label,
+      revision: meta.revision,
+      ops: loadRecordOps(recordId),
+    };
+  } else {
+    const versionId = toPosInt(input.version_id);
+    if (Number.isNaN(versionId)) {
+      return err(res, 400, `版本编号无效：${JSON.stringify(input.version_id)}（须为正整数）`);
+    }
+    snap = loadVersionSnapshot(versionId);
+    if (!snap) return err(res, 404, `版本不存在：#${versionId}`);
+  }
+
+  const win = parseLoadWindow(input);
+  if (win.error) return err(res, 400, win.error);
+  const { start, end, at } = win.value;
+
+  // 实际亮度：版本直接跑快照 Cue；记录则叠加其覆盖/归还操作序列
+  const baseCues = Engine.prepareCues(snap.cues);
+  const byLight = recordInfo
+    ? Engine.prepareOverrides(recordInfo.ops, baseCues)
+    : new Map();
+
+  const membersByCircuit = buildCircuitMembers(snap);
+  const nameOfLight = new Map(snap.lights.map((l) => [l.id, l.name]));
+
+  const circuits = snap.circuits.map((c) => {
+    const members = membersByCircuit.get(c.id) || [];
+    const load = Engine.circuitLoadAt(byLight, baseCues, members, at);
+    const intervals =
+      end > start
+        ? Engine.circuitOverloadIntervals(byLight, baseCues, members, start, end, c.capacity)
+        : [];
+    return {
+      circuit_id: c.id,
+      name: c.name,
+      capacity: c.capacity,
+      lights: members.map((m) => ({
+        light_id: m.light_id,
+        name: nameOfLight.get(m.light_id) ?? `#${m.light_id}`,
+        watts: m.watts,
+      })),
+      load_at: round6(load),
+      overloaded: load - c.capacity > 1e-9,
+      intervals,
+    };
+  });
+
+  res.json({
+    source: recordInfo
+      ? {
+          kind: 'record',
+          record: { id: recordInfo.id, label: recordInfo.label, revision: recordInfo.revision },
+          version: { id: snap.id, label: snap.label },
+        }
+      : { kind: 'version', version: { id: snap.id, label: snap.label } },
+    window: { start, end },
+    at,
+    // 早期无回路配置的版本：回路为空，播放照常，不产生回路负载
+    has_circuit_config: snap.circuits.length > 0,
+    circuits,
+  });
+}
+
+app.get('/api/load', handleLoad);
+app.post('/api/load', handleLoad);
 
 /* ------------------------------- 错误处理 ------------------------------ */
 

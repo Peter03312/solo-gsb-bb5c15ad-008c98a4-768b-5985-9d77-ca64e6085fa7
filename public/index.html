@@ -13,6 +13,7 @@
       <button class="tab active" data-tab="player">排演播放</button>
       <button class="tab" data-tab="records">调光记录</button>
       <button class="tab" data-tab="compare">版本比对</button>
+      <button class="tab" data-tab="load">回路负载</button>
       <button class="tab" data-tab="lights">灯具录入</button>
       <button class="tab" data-tab="cues">草稿 Cue</button>
       <button class="tab" data-tab="publish">发布版本</button>
@@ -137,6 +138,67 @@
       </div>
     </section>
 
+    <!-- ============================ 回路负载 ============================ -->
+    <section id="tab-load" class="tab-panel">
+      <div class="card">
+        <h2>回路超载预判</h2>
+        <p class="muted">
+          选择一个<strong>已发布版本</strong>，或选择<strong>绑定它的临时调光记录</strong>（实际输出含覆盖/归还）。
+          给定非负时窗起点/终点与窗内查看时刻，系统按每盏灯<strong>实际亮度 ÷ 100 × 额定瓦数</strong>
+          汇总到所属回路，返回查看时刻各回路负载，并精确列出时窗内负载<strong>严格大于</strong>回路容量的
+          全部连续区间（<code>[ ]</code> 含端点、<code>( )</code> 不含端点）。未分配回路的灯具不计入负载；
+          发布早于回路功能的旧版本无回路配置、不产生负载。分析全程只读，不改动草稿、版本、记录与播放。
+        </p>
+        <form id="form-load" class="cue-form">
+          <label>分析对象
+            <select id="load-target-type">
+              <option value="version">已发布版本</option>
+              <option value="record">临时调光记录</option>
+            </select>
+          </label>
+          <label id="load-version-wrap">版本
+            <select id="load-version" required></select>
+          </label>
+          <label id="load-record-wrap" hidden>调光记录
+            <select id="load-record" required></select>
+          </label>
+          <label>时窗起点 (s) <input type="number" id="load-start" min="0" step="0.1" value="0" required /></label>
+          <label>时窗终点 (s) <input type="number" id="load-end" min="0" step="0.1" value="10" required /></label>
+          <label>查看时刻 (s) <input type="number" id="load-at" min="0" step="0.1" value="0" required /></label>
+          <button class="primary" type="submit">分析回路负载</button>
+        </form>
+        <div id="load-error" class="error-line" hidden></div>
+      </div>
+
+      <div id="load-result" hidden>
+        <div class="card">
+          <h2 id="load-at-title">查看时刻回路负载</h2>
+          <p class="muted" id="load-window-note"></p>
+          <div class="table-wrap">
+            <table id="load-table">
+              <thead>
+                <tr><th>回路</th><th>容量 (W)</th><th>当前负载 (W)</th><th>余量 (W)</th><th>状态</th><th>成员灯具</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>严格超出容量的连续区间</h2>
+          <div class="table-wrap">
+            <table id="load-intervals">
+              <thead>
+                <tr><th>回路</th><th>超载区间（秒，[含 / (不含）</th><th>数量</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="load-no-over" class="muted" hidden>时窗内没有任何回路严格超出容量。</p>
+        </div>
+      </div>
+    </section>
+
     <!-- ============================ 调光记录 ============================ -->
     <section id="tab-records" class="tab-panel">
       <div class="card">
@@ -237,7 +299,28 @@
         <div id="light-error" class="error-line" hidden></div>
         <div class="table-wrap">
           <table id="light-table">
-            <thead><tr><th>编号</th><th>名称</th><th>操作</th></tr></thead>
+            <thead><tr><th>编号</th><th>名称</th><th>所属回路</th><th>额定瓦数 (W)</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>灯光回路</h2>
+        <p class="muted">
+          回路容量为<strong>正数瓦数</strong>。把灯具分配到回路并登记<strong>正数额定瓦数</strong>后，
+          发布版本时一并冻结；<strong>未分配回路</strong>的灯具不计入任何回路负载。
+          容量/瓦数/回路引用非法时会明确拒绝且不保存。
+        </p>
+        <form id="form-circuit" class="inline-form">
+          <input type="text" id="circuit-name" placeholder="回路名称，如：面光回路、侧光回路" required />
+          <input type="number" id="circuit-capacity" min="0" step="1" placeholder="容量（瓦，正数）" style="max-width:11rem" required />
+          <button class="primary" type="submit">添加回路</button>
+        </form>
+        <div id="circuit-error" class="error-line" hidden></div>
+        <div class="table-wrap">
+          <table id="circuit-table">
+            <thead><tr><th>编号</th><th>名称</th><th>容量 (W)</th><th>灯具数</th><th>操作</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>

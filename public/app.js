@@ -4,6 +4,7 @@ const Engine = window.LightingEngine;
 
 const state = {
   lights: [],
+  circuits: [],
   cues: [],
   versions: [],
   records: [],
@@ -61,15 +62,37 @@ async function loadLights() {
   renderLightOptions();
 }
 
+function circuitOptions(selectedId, { allowUnassigned = true } = {}) {
+  const none = allowUnassigned ? '<option value="">— 未分配 —</option>' : '';
+  return (
+    none +
+    state.circuits
+      .map((c) => `<option value="${c.id}" ${String(c.id) === String(selectedId) ? 'selected' : ''}>#${c.id} ${esc(c.name)}</option>`)
+      .join('')
+  );
+}
+
 function renderLights() {
   const tb = $('light-table').querySelector('tbody');
   tb.innerHTML = state.lights
     .map(
       (l) => `
-      <tr>
+      <tr data-light-id="${l.id}">
         <td>#${l.id}</td>
         <td>${esc(l.name)}</td>
-        <td><button class="danger" data-del-light="${l.id}">删除</button></td>
+        <td>
+          <select data-w="circuit_id">
+            ${circuitOptions(l.circuit_id)}
+          </select>
+        </td>
+        <td class="edit-cell">
+          <input data-w="watts" type="number" min="0" step="1" placeholder="未分配"
+            value="${l.watts ?? ''}" ${l.circuit_id ? '' : 'disabled'} style="width:7rem" />
+        </td>
+        <td>
+          <button data-save-wiring="${l.id}">保存接线</button>
+          <button class="danger" data-del-light="${l.id}">删除</button>
+        </td>
       </tr>`
     )
     .join('');
@@ -94,15 +117,102 @@ $('form-light').addEventListener('submit', async (e) => {
   }
 });
 
+// 接线：行内选择回路 + 填写瓦数后整行提交；未分配回路时瓦数留空
 $('light-table').addEventListener('click', async (e) => {
-  const id = e.target.dataset?.delLight;
-  if (!id) return;
+  const saveId = e.target.dataset?.saveWiring;
+  const delId = e.target.dataset?.delLight;
   clearErr($('light-error'));
   try {
-    await api('DELETE', `/api/lights/${id}`);
-    await loadLights();
+    if (saveId) {
+      const tr = e.target.closest('tr');
+      const circuit_id = tr.querySelector('[data-w="circuit_id"]').value;
+      const watts = tr.querySelector('[data-w="watts"]').value;
+      const body = circuit_id ? { circuit_id, watts } : { circuit_id: null };
+      await api('PUT', `/api/lights/${saveId}/wiring`, body);
+      await loadLights();
+      await loadCircuits();
+    } else if (delId) {
+      await api('DELETE', `/api/lights/${delId}`);
+      await loadLights();
+    }
   } catch (err) {
     showErr($('light-error'), err.message);
+  }
+});
+
+// 选中回路后才允许填写瓦数
+$('light-table').addEventListener('change', (e) => {
+  if (e.target.dataset?.w !== 'circuit_id') return;
+  const tr = e.target.closest('tr');
+  tr.querySelector('[data-w="watts"]').disabled = !e.target.value;
+});
+
+/* ----------------------------- 回路 ----------------------------- */
+
+async function loadCircuits() {
+  state.circuits = await api('GET', '/api/circuits');
+  renderCircuits();
+  renderLights();
+  renderLoadOptions();
+}
+
+function renderCircuits() {
+  const tb = $('circuit-table').querySelector('tbody');
+  if (state.circuits.length === 0) {
+    tb.innerHTML = '<tr><td colspan="5" class="muted">还没有回路。</td></tr>';
+    return;
+  }
+  tb.innerHTML = state.circuits
+    .map(
+      (c) => `
+      <tr data-circuit-id="${c.id}">
+        <td>#${c.id}</td>
+        <td class="edit-cell"><input data-c="name" value="${esc(c.name)}" /></td>
+        <td class="edit-cell"><input data-c="capacity" type="number" min="0" step="1" value="${c.capacity}" style="width:7rem" /></td>
+        <td>${c.light_count}</td>
+        <td>
+          <button data-save-circuit="${c.id}">保存</button>
+          <button class="danger" data-del-circuit="${c.id}">删除</button>
+        </td>
+      </tr>`
+    )
+    .join('');
+}
+
+$('form-circuit').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('circuit-error'));
+  const name = $('circuit-name').value.trim();
+  const capacity = $('circuit-capacity').value;
+  try {
+    await api('POST', '/api/circuits', { name, capacity });
+    $('circuit-name').value = '';
+    $('circuit-capacity').value = '';
+    await loadCircuits();
+  } catch (err) {
+    showErr($('circuit-error'), err.message);
+  }
+});
+
+$('circuit-table').addEventListener('click', async (e) => {
+  const saveId = e.target.dataset?.saveCircuit;
+  const delId = e.target.dataset?.delCircuit;
+  clearErr($('circuit-error'));
+  try {
+    if (saveId) {
+      const tr = e.target.closest('tr');
+      const body = {};
+      tr.querySelectorAll('[data-c]').forEach((el) => {
+        body[el.dataset.c] = el.dataset.c === 'name' ? el.value : el.value;
+      });
+      await api('PATCH', `/api/circuits/${saveId}`, body);
+      await loadCircuits();
+    } else if (delId) {
+      await api('DELETE', `/api/circuits/${delId}`);
+      await loadCircuits();
+    }
+  } catch (err) {
+    showErr($('circuit-error'), err.message);
   }
 });
 
@@ -218,6 +328,7 @@ async function loadVersions({ keepSelection = true } = {}) {
   renderVersionOptions(keepSelection ? prev : null);
   renderCompareOptions();
   renderRecordVersionOptions();
+  renderLoadOptions();
   if (keepSelection) {
     if (state.versions.some((v) => String(v.id) === String(prevA))) $('cmp-version-a').value = prevA;
     if (state.versions.some((v) => String(v.id) === String(prevB))) $('cmp-version-b').value = prevB;
@@ -541,6 +652,109 @@ function renderCompare(d) {
   $('cmp-config').innerHTML = cfgHtml || '<p class="muted">两版灯具配置一致。</p>';
 }
 
+/* ------------------------- 回路负载预判 ------------------------- */
+
+function renderLoadOptions() {
+  const vs = $('load-version');
+  if (state.versions.length === 0) {
+    vs.innerHTML = '<option value="">— 暂无已发布版本 —</option>';
+  } else {
+    vs.innerHTML = state.versions
+      .map((v) => `<option value="${v.id}">#${v.id} ${esc(v.label)}</option>`)
+      .join('');
+  }
+  const rs = $('load-record');
+  if (state.records.length === 0) {
+    rs.innerHTML = '<option value="">— 暂无调光记录 —</option>';
+  } else {
+    rs.innerHTML = state.records
+      .map((r) => `<option value="${r.id}">#${r.id} ${esc(r.label)}（绑定版本 #${r.version_id}）</option>`)
+      .join('');
+  }
+}
+
+$('load-target-type').addEventListener('change', (e) => {
+  const isRecord = e.target.value === 'record';
+  $('load-version-wrap').hidden = isRecord;
+  $('load-record-wrap').hidden = !isRecord;
+});
+
+$('form-load').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('load-error'));
+  const isRecord = $('load-target-type').value === 'record';
+  const body = {
+    start: $('load-start').value,
+    end: $('load-end').value,
+    at: $('load-at').value,
+  };
+  if (isRecord) body.record_id = $('load-record').value;
+  else body.version_id = $('load-version').value;
+  try {
+    const d = await api('POST', '/api/load', body);
+    renderLoad(d);
+  } catch (err) {
+    $('load-result').hidden = true;
+    showErr($('load-error'), '分析失败：' + err.message);
+  }
+});
+
+function renderLoad(d) {
+  $('load-result').hidden = false;
+  const src =
+    d.source.kind === 'record'
+      ? `调光记录 #${d.source.record.id}（${esc(d.source.record.label)}，修订号 ${d.source.record.revision}）· 绑定版本 #${d.source.version.id}`
+      : `已发布版本 #${d.source.version.id}（${esc(d.source.version.label)}）`;
+  $('load-at-title').textContent = `查看时刻 t = ${fmt(d.at)} s 的回路负载（${src}）`;
+  const zeroWindow = d.window.start === d.window.end;
+  $('load-window-note').textContent = zeroWindow
+    ? `零长度时窗 [${fmt(d.window.start)}, ${fmt(d.window.end)}]：仅返回该时刻负载，不产生区间。`
+    : `时窗 [${fmt(d.window.start)}, ${fmt(d.window.end)}] 秒；负载严格大于容量才计入超载区间，端点 [含 / (不含。`;
+
+  if (!d.has_circuit_config) {
+    $('load-table').querySelector('tbody').innerHTML =
+      '<tr><td colspan="6" class="muted">该版本发布时没有任何回路配置：播放照常，不产生回路负载。</td></tr>';
+    $('load-intervals').querySelector('tbody').innerHTML = '';
+    $('load-no-over').hidden = true;
+    return;
+  }
+
+  $('load-table').querySelector('tbody').innerHTML = d.circuits
+    .map((c) => {
+      const margin = c.capacity - c.load_at;
+      const badge = c.overloaded
+        ? '<span class="badge fading">超载</span>'
+        : '<span class="badge done">正常</span>';
+      const members =
+        c.lights.length === 0
+          ? '<span class="muted">（无灯具）</span>'
+          : c.lights.map((l) => `#${l.light_id} ${esc(l.name)}·${fmt(l.watts)}W`).join('、');
+      return `
+        <tr class="${c.overloaded ? 'cmp-hot' : ''}">
+          <td>#${c.circuit_id} ${esc(c.name)}</td>
+          <td>${fmt(c.capacity)}</td>
+          <td><b>${fmt(c.load_at)}</b></td>
+          <td>${margin < 0 ? `<span class="danger-text">${fmt(margin)}</span>` : fmt(margin)}</td>
+          <td>${badge}</td>
+          <td class="cmp-iv-list">${members}</td>
+        </tr>`;
+    })
+    .join('');
+
+  const hot = d.circuits.filter((c) => c.intervals.length > 0);
+  $('load-intervals').querySelector('tbody').innerHTML = hot
+    .map(
+      (c) => `
+      <tr>
+        <td>#${c.circuit_id} ${esc(c.name)}</td>
+        <td class="cmp-iv-list">${c.intervals.map(intervalText).map(esc).join('，')}</td>
+        <td>${c.intervals.length}</td>
+      </tr>`
+    )
+    .join('');
+  $('load-no-over').hidden = hot.length > 0;
+}
+
 /* ------------------------- 临时调光记录（覆盖/归还） ------------------------- */
 
 const HASH_RECORD = 'record';
@@ -581,6 +795,7 @@ async function loadRecordList({ preserveOpen = false } = {}) {
   state.records = await api('GET', '/api/records');
   renderRecordTable();
   renderRecordVersionOptions();
+  renderLoadOptions();
   if (preserveOpen && openId && state.records.some((r) => r.id === openId)) {
     await loadRecord(openId, false); // 追加成功后用服务器返回的新修订号刷新详情
   }
@@ -815,20 +1030,23 @@ function renderRecordOutput() {
 
 (async function init() {
   try {
-    [state.lights, state.cues, state.versions, state.records] = await Promise.all([
+    [state.lights, state.circuits, state.cues, state.versions, state.records] = await Promise.all([
       api('GET', '/api/lights'),
+      api('GET', '/api/circuits'),
       api('GET', '/api/cues'),
       api('GET', '/api/versions'),
       api('GET', '/api/records'),
     ]);
     renderLights();
     renderLightOptions();
+    renderCircuits();
     renderCues();
     renderVersions();
     renderVersionOptions(null);
     renderCompareOptions();
     renderRecordVersionOptions();
     renderRecordTable();
+    renderLoadOptions();
 
     // 刷新后按 #record=<id>&t=<time> 重算该记录
     const hash = readHash();
